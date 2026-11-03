@@ -21,7 +21,7 @@ UPSTREAM_INSTALLER="https://get.featherpanel.com/installer.sh"
 ROLE=""; PANEL_FQDN=""; NODE_FQDN=""; EMAIL=""; NODE_CMD=""
 NO_SSL=0; AUTO=0; FORCE_WEB=0
 MODE="install"; YES=0; WIPE_DOCKER=0
-NO_PROVISION=0; LOCATION_NAME="ZerotzyID Location"; NODE_NAME="ZerotzyID Node"
+WIPE_CERTS=0; NO_FALLBACK=0; RL_MARK=/run/zerotzyid-ratelimit; NO_PROVISION=0; LOCATION_NAME="ZerotzyID Location"; NODE_NAME="ZerotzyID Node"
 NODE_PROVISIONED=0; NODE_ID=""; LOC_ID=""; NODE_VERIFY=""
 ALLOC_RANGE="25565-25600"; NO_ALLOC=0; JOIN_BLOB=""; ADD_NODE_FQDN=""
 Z_UUID=""; Z_TID=""; Z_TOK=""; NODE_IP=""
@@ -180,6 +180,8 @@ Opsi:
   --node-name N      Nama Node otomatis (default: ZerotzyID Node)
   --diag             Kumpulkan info diagnosa (tanpa rahasia) ke /root/zerotzyid-diag.txt
   --yes, -y          Lewati konfirmasi hapus (wajib untuk --bot)
+  --no-fallback      Jangan pakai CA cadangan (ZeroSSL) saat Let's Encrypt kena rate limit
+  --wipe-certs       Saat hapus: hapus juga sertifikat SSL (default: DIPERTAHANKAN)
   --wipe-docker      Saat hapus: prune semua image/volume Docker yang tak terpakai
   -h, --help         Bantuan ini
 
@@ -211,6 +213,8 @@ while [ $# -gt 0 ]; do
 	--node-name) NODE_NAME="${2:-$NODE_NAME}"; shift ;;
 	--yes | -y) YES=1 ;;
 	--wipe-docker) WIPE_DOCKER=1 ;;
+	--wipe-certs) WIPE_CERTS=1 ;;
+	--no-fallback) NO_FALLBACK=1 ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "Opsi tidak dikenal: $1 (lihat --help)"; exit 1 ;;
 	esac
@@ -444,16 +448,122 @@ certbot_email_args() {
 	if [ -n "$EMAIL" ]; then printf '%s\n' -m "$EMAIL"; else printf '%s\n' --register-unsafely-without-email; fi
 }
 
+cert_dir() {
+	if [ -s "/etc/letsencrypt/live/$1/fullchain.pem" ]; then echo "/etc/letsencrypt/live/$1"; else echo "/etc/zerotzyid/certs/$1"; fi
+}
+cert_valid() { # ada & masih valid > 14 hari
+	local d; d=$(cert_dir "$1")
+	[ -s "$d/fullchain.pem" ] && openssl x509 -checkend 1209600 -noout -in "$d/fullchain.pem" >/dev/null 2>&1
+}
+
+cert_hint() { # output certbot -> petunjuk singkat
+	local o="$1"
+	case "$o" in
+	*"too many certificates"* | *"rateLimited"* | *"too many failed"* | *"too many new orders"* | *"too many requests"*)
+		touch "$RL_MARK"
+		echo "[CERT] KENA RATE LIMIT Let's Encrypt (batas per domain induk). $(grep -oiE 'retry after [^:]*:[^:]*:[0-9]+ UTC' <<<"$o" | head -n1)" ;;
+	*"Timeout during connect"* | *"Connection refused"* | *"Could not connect"* | *"Connection reset"*)
+		echo "[CERT] Port 80 tidak terjangkau dari internet. Buka port 80/443 di firewall/security group penyedia VPS." ;;
+	*"NXDOMAIN"* | *"no valid A records"* | *"DNS problem"*)
+		echo "[CERT] DNS belum tersebar / A record belum benar. Tunggu beberapa menit lalu coba lagi." ;;
+	*"Invalid response"* | *"unauthorized"* | *"404"*)
+		echo "[CERT] Validasi HTTP ditolak: domain mungkin lewat proxy (Cloudflare), atau web server lain menjawab di port 80." ;;
+	*) echo "[CERT] $(grep -iE 'error|problem|detail|failed' <<<"$o" | head -n 3 | tr '\n' ' ')$(tail -n 2 <<<"$o" | tr '\n' ' ')" ;;
+	esac
+}
+
+# Nginx HTTPS manual (dipakai untuk sertifikat cadangan / pemakaian ulang sertifikat)
+setup_nginx_tls() { # direktori sertifikat
+	local d="$1" f=/etc/nginx/sites-available/zerotzyid-panel
+	[ -s "$d/fullchain.pem" ] && [ -s "$d/privkey.pem" ] || return 1
+	cat >"$f" <<'EOF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __FQDN__;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name __FQDN__;
+    ssl_certificate __CERT__/fullchain.pem;
+    ssl_certificate_key __CERT__/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 100m;
+
+    location / {
+        proxy_pass http://127.0.0.1:__PORT__;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $zerotzy_conn_upgrade;
+        proxy_buffer_size 16k;
+        proxy_buffers 8 16k;
+        proxy_busy_buffers_size 32k;
+        proxy_connect_timeout 15s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+EOF
+	sed -i "s|__CERT__|$d|g; s/__FQDN__/$PANEL_FQDN/g; s/__PORT__/$PANEL_PORT/g" "$f"
+	nginx_heal || return 1
+	systemctl reload nginx
+}
+
+# CA cadangan (ZeroSSL via acme.sh) jika Let's Encrypt kena rate limit
+acme_fallback() { # fqdn
+	local fq="$1" em="${EMAIL:-admin@$1}" d="/etc/zerotzyid/certs/$1" acme rc
+	export HOME=/root; acme=/root/.acme.sh/acme.sh
+	apt_install socat || true
+	if [ ! -x "$acme" ]; then
+		fetch https://get.acme.sh /tmp/get-acme.sh || return 1
+		sh /tmp/get-acme.sh email="$em" || return 1
+	fi
+	"$acme" --register-account -m "$em" --server zerossl || true
+	"$acme" --issue --standalone -d "$fq" --server zerossl --httpport 80 \
+		--pre-hook "systemctl stop nginx 2>/dev/null || true" \
+		--post-hook "systemctl start nginx 2>/dev/null || true"
+	rc=$?
+	[ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || { echo "[CERT] CA cadangan (ZeroSSL) juga gagal (kode $rc)"; return 1; }
+	mkdir -p "$d"
+	"$acme" --install-cert -d "$fq" --fullchain-file "$d/fullchain.pem" --key-file "$d/privkey.pem" \
+		--reloadcmd "systemctl reload nginx 2>/dev/null || true; systemctl restart featherwings 2>/dev/null || true"
+	echo "[CERT] sertifikat cadangan terpasang di $d"
+}
+
 issue_panel_cert() {
-	local ea=(); mapfile -t ea < <(certbot_email_args)
-	certbot --nginx -d "$PANEL_FQDN" --non-interactive --agree-tos --redirect "${ea[@]}"
+	local ea=() out rc
+	rm -f "$RL_MARK"
+	mapfile -t ea < <(certbot_email_args)
+	if cert_valid "$PANEL_FQDN"; then
+		echo "[CERT] sertifikat panel yang sudah ada dipakai ulang (tidak menerbitkan baru)"
+		setup_nginx_tls "$(cert_dir "$PANEL_FQDN")" && return 0
+	fi
+	out=$(certbot --nginx -d "$PANEL_FQDN" --non-interactive --agree-tos --redirect "${ea[@]}" 2>&1); rc=$?
+	printf '%s\n' "$out"
+	[ "$rc" -eq 0 ] || cert_hint "$out"
+	return "$rc"
 }
 
 issue_node_cert() {
-	local ea=(); mapfile -t ea < <(certbot_email_args)
-	certbot certonly --standalone -d "$NODE_FQDN" --non-interactive --agree-tos "${ea[@]}" \
+	local ea=() out rc
+	rm -f "$RL_MARK"
+	mapfile -t ea < <(certbot_email_args)
+	if cert_valid "$NODE_FQDN"; then
+		echo "[CERT] sertifikat node yang sudah ada dipakai ulang (tidak menerbitkan baru)"
+		return 0
+	fi
+	out=$(certbot certonly --standalone -d "$NODE_FQDN" --non-interactive --agree-tos "${ea[@]}" \
 		--pre-hook "systemctl stop nginx 2>/dev/null || true" \
-		--post-hook "systemctl start nginx 2>/dev/null || true"
+		--post-hook "systemctl start nginx 2>/dev/null || true" 2>&1); rc=$?
+	printf '%s\n' "$out"
+	[ "$rc" -eq 0 ] || cert_hint "$out"
+	return "$rc"
 }
 
 install_wings() {
@@ -482,6 +592,7 @@ open_firewall() {
 
 # ------------------------------------- auto Location + Node lewat database
 STATE=/run/zerotzyid-prov.env
+T_NODE=featherpanel_nodes; T_LOC=featherpanel_locations; T_ALLOC=featherpanel_allocations
 DB_CT=""; DB_NAME=""; BE_CT=""; BE_ROOT=""; WV=""
 declare -A VAL=()
 declare -A COLCACHE=()
@@ -500,21 +611,30 @@ lit2json() {
 	esac
 }
 
+# Cari container DB yang BENAR-BENAR berisi tabel node panel (bukan DB sisa proyek lain).
 find_db() {
-	local c
+	local c r
 	for c in $(docker ps --format '{{.Names}}'); do
-		if docker exec "$c" sh -c 'test -n "${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}"' 2>/dev/null; then
-			DB_CT="$c"; return 0
+		docker exec "$c" sh -c 'test -n "${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}"' 2>/dev/null || continue
+		DB_CT="$c"
+		r=$(echo "SELECT table_schema,table_name FROM information_schema.columns WHERE column_name='daemon_token_id' AND table_name LIKE '%\_nodes' AND table_name NOT LIKE '%web%' AND table_name NOT LIKE '%vm%' ORDER BY (table_name='featherpanel_nodes') DESC, LENGTH(table_name) LIMIT 1;" | mysql_x 2>/dev/null | head -n1)
+		if [ -n "$r" ]; then
+			DB_NAME=${r%%$'\t'*}; T_NODE=${r#*$'\t'}
+			T_LOC="${T_NODE%nodes}locations"; T_ALLOC="${T_NODE%nodes}allocations"
+			return 0
 		fi
 	done
-	return 1
+	DB_CT=""; return 1
 }
 
+# Cari container backend dengan memeriksa file `cli` + vendor (tidak bergantung pada nama container).
 find_backend() {
-	BE_CT=$(docker ps --format '{{.Names}}' | grep -m1 -x 'featherpanel_backend' || docker ps --format '{{.Names}}' | grep -m1 -i backend || true)
-	[ -n "$BE_CT" ] || return 1
-	BE_ROOT=$(docker exec "$BE_CT" sh -c 'for d in /var/www/html /var/www/html/backend /app /var/www/backend; do [ -f "$d/vendor/autoload.php" ] && echo "$d" && break; done' 2>/dev/null)
-	[ -n "$BE_ROOT" ]
+	local c r
+	for c in $(docker ps --format '{{.Names}}'); do
+		r=$(docker exec "$c" sh -c 'for d in /var/www/html /var/www/html/backend /app /var/www/backend; do [ -f "$d/cli" ] && [ -f "$d/vendor/autoload.php" ] && echo "$d" && break; done' 2>/dev/null)
+		if [ -n "$r" ]; then BE_CT="$c"; BE_ROOT="$r"; return 0; fi
+	done
+	BE_CT=""; BE_ROOT=""; return 1
 }
 
 # kolom tabel: nama<TAB>tipe<TAB>nullable<TAB>default(<<NULL>> = tanpa default)<TAB>extra
@@ -609,8 +729,8 @@ api:
   port: 8080
   ssl:
     enabled: $ssl
-    cert: /etc/letsencrypt/live/$NODE_FQDN/fullchain.pem
-    key: /etc/letsencrypt/live/$NODE_FQDN/privkey.pem
+    cert: $(cert_dir "$NODE_FQDN")/fullchain.pem
+    key: $(cert_dir "$NODE_FQDN")/privkey.pem
   upload_limit: 1024
 system:
   data: /var/lib/featherpanel/volumes
@@ -634,24 +754,28 @@ wings_start_verify() { # scheme
 }
 
 db_prepare() {
-	local i bk t_node=featherpanel_nodes
-	find_db || { echo "[PROV] container database tidak ditemukan"; return 1; }
-	find_backend || echo "[PROV] container backend tidak ditemukan (pakai jalur SQL langsung)"
-	for i in $(seq 1 40); do
-		DB_NAME=$(echo "SELECT table_schema FROM information_schema.tables WHERE table_name='$t_node' LIMIT 1;" | mysql_x 2>/dev/null | head -n1)
-		[ -n "$DB_NAME" ] && break
-		sleep 3
+	local i bk c
+	for i in $(seq 1 60); do
+		find_db && break
+		sleep 5
 	done
-	[ -n "$DB_NAME" ] || { echo "[PROV] tabel $t_node belum ada (migrasi panel belum selesai?)"; return 1; }
-	echo "[PROV] database=$DB_NAME db=$DB_CT backend=${BE_CT:-none}"
+	if [ -z "$DB_CT" ]; then
+		echo "[PROV] tabel node panel tidak ditemukan di container DB mana pun (menunggu 5 menit)"
+		for c in $(docker ps --format '{{.Names}}'); do
+			echo "[PROV] kontainer: $c | var-env DB: $(docker exec "$c" env 2>/dev/null | grep -iE 'mysql|mariadb|database|db_' | cut -d= -f1 | tr '\n' ' ')"
+		done
+		return 1
+	fi
+	find_backend || echo "[PROV] container backend (php cli) tidak ditemukan - pakai jalur SQL langsung"
+	echo "[PROV] database=$DB_NAME tabel=$T_NODE db=$DB_CT backend=${BE_CT:-none}"
 	bk="/root/zerotzyid-db-backup-$(date +%Y%m%d-%H%M%S).sql"
-	docker exec "$DB_CT" sh -c 'exec $(command -v mysqldump || command -v mariadb-dump) -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" "$@"' sh "$DB_NAME" featherpanel_locations featherpanel_nodes featherpanel_allocations >"$bk" 2>/dev/null &&
+	docker exec "$DB_CT" sh -c 'exec $(command -v mysqldump || command -v mariadb-dump) -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" "$@"' sh "$DB_NAME" "$T_LOC" "$T_NODE" >"$bk" 2>/dev/null &&
 		{ chmod 600 "$bk"; echo "[PROV] backup tabel: $bk"; } || echo "[PROV] backup dilewati"
 }
 
 # Hasil: LOC_ID NODE_ID Z_UUID Z_TID Z_TOK
 db_create_node() { # fqdn scheme ip
-	local fq="$1" scheme="$2" ip="$3" t_loc=featherpanel_locations t_node=featherpanel_nodes t_alloc=featherpanel_allocations
+	local fq="$1" scheme="$2" ip="$3" t_loc="$T_LOC" t_node="$T_NODE" t_alloc="$T_ALLOC"
 	local sql slug stored a b p cnt json via=""
 	slug=$(tr '[:upper:] ' '[:lower:]-' <<<"$LOCATION_NAME" | tr -cd 'a-z0-9-')
 	LOC_ID=$(echo "SELECT id FROM \`$t_loc\` WHERE name=$(sqlq "$LOCATION_NAME") LIMIT 1;" | mysql_x "$DB_NAME" 2>/dev/null | head -n1)
@@ -836,7 +960,7 @@ purge_web() {
 		systemctl reload apache2 2>/dev/null || true
 	fi
 	if command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null; then systemctl reload nginx 2>/dev/null || true; fi
-	if command -v certbot >/dev/null 2>&1; then
+	if [ "$WIPE_CERTS" = 1 ] && command -v certbot >/dev/null 2>&1; then
 		for d in $(printf '%s\n' $doms | sort -u); do
 			valid_fqdn "$d" && [ -d "/etc/letsencrypt/live/$d" ] &&
 				certbot delete --cert-name "$d" --non-interactive || true
@@ -863,7 +987,7 @@ purge_all() {
 	say ""
 	say "  ${CR}${CB}HAPUS TOTAL${C0} - ini akan menghapus PERMANEN:"
 	say "   - Panel: container, database/volume, image, ${PANEL_DIR}"
-	say "   - Config Nginx panel + sertifikat SSL (panel/node)"
+	say "   - Config Nginx panel (sertifikat SSL dipertahankan agar tidak kena rate limit Let's Encrypt; hapus dengan --wipe-certs)"
 	say "   - Wings, /etc/featherpanel, /var/lib/featherpanel (${CB}data server game${C0})"
 	[ "$WIPE_DOCKER" = 1 ] && say "   - Semua image/volume Docker yang tidak terpakai (--wipe-docker)"
 	say "   ${CY}Docker, Nginx, dan paket dasar tidak dihapus.${C0}"
@@ -895,8 +1019,8 @@ finish() {
 	if has_node; then
 		say "  ${CB}Node${C0}   : ${CG}${NODE_FQDN}${C0}  (Wings terpasang)"
 		if [ "$NODE_SSL" = 1 ]; then
-			say "           SSL : /etc/letsencrypt/live/${NODE_FQDN}/fullchain.pem"
-			say "                 /etc/letsencrypt/live/${NODE_FQDN}/privkey.pem"
+			say "           SSL : $(cert_dir "$NODE_FQDN")/fullchain.pem"
+			say "                 $(cert_dir "$NODE_FQDN")/privkey.pem"
 		fi
 		if [ "$NODE_PROVISIONED" = 1 ]; then
 			say "           Location id=$LOC_ID & Node id=$NODE_ID dibuat otomatis (memory/disk unlimited)."
@@ -943,7 +1067,7 @@ if [ "$MODE" = addnode ]; then
 	command -v docker >/dev/null 2>&1 || die "--add-node harus dijalankan di server PANEL (Docker tidak ditemukan)."
 	PANEL_URL=$(derive_panel_url) || die "Konfigurasi panel (Nginx) tidak ditemukan. Jalankan di server panel."
 	rm -f "$STATE"
-	run "Membuat Location + Node di panel" 420 addnode_main || { grep '^\[PROV\]' "$LOG" | tail -n 6 | sed 's/^/    /'; die "Gagal membuat node di panel (lihat $LOG, coba --diag)"; }
+	run "Membuat Location + Node di panel" 600 addnode_main || { grep '^\[PROV\]' "$LOG" | tail -n 6 | sed 's/^/    /'; die "Gagal membuat node di panel (lihat $LOG, coba --diag)"; }
 	grep '^\[PROV\]' "$LOG" | tail -n 8 | sed 's/^/    /'
 	# shellcheck disable=SC1090
 	. "$STATE"; rm -f "$STATE"
@@ -1026,7 +1150,19 @@ if has_panel; then
 		elif run "Membuat sertifikat SSL panel" 240 issue_panel_cert; then
 			PANEL_URL="https://$PANEL_FQDN"
 		else
-			warn "SSL gagal, panel tetap jalan via HTTP. Coba lagi: certbot --nginx -d $PANEL_FQDN"
+			grep '^\[CERT\]' "$LOG" | tail -n 3 | sed 's/^/    /'
+			if [ -f "$RL_MARK" ] && [ "$NO_FALLBACK" != 1 ]; then
+				info "Let's Encrypt kena rate limit -> mencoba CA cadangan (ZeroSSL via acme.sh)"
+				if run "Sertifikat cadangan ZeroSSL (panel)" 480 acme_fallback "$PANEL_FQDN" &&
+					run "Mengaktifkan HTTPS di Nginx" 120 setup_nginx_tls "$(cert_dir "$PANEL_FQDN")"; then
+					PANEL_URL="https://$PANEL_FQDN"
+				else
+					grep '^\[CERT\]' "$LOG" | tail -n 2 | sed 's/^/    /'
+					warn "SSL cadangan juga gagal; panel tetap via HTTP. Jalankan installer lagi setelah batas rate limit reset."
+				fi
+			else
+				warn "SSL gagal, panel tetap jalan via HTTP. Coba lagi: certbot --nginx -d $PANEL_FQDN"
+			fi
 		fi
 	fi
 fi
@@ -1046,14 +1182,26 @@ if has_node; then
 		elif run "Membuat sertifikat SSL node" 240 issue_node_cert; then
 			NODE_SSL=1
 		else
-			warn "SSL node gagal. Coba lagi: certbot certonly --standalone -d $NODE_FQDN"
+			grep '^\[CERT\]' "$LOG" | tail -n 3 | sed 's/^/    /'
+			if [ -f "$RL_MARK" ] && [ "$NO_FALLBACK" != 1 ]; then
+				info "Let's Encrypt kena rate limit -> mencoba CA cadangan (ZeroSSL via acme.sh)"
+				if run "Sertifikat cadangan ZeroSSL (node)" 480 acme_fallback "$NODE_FQDN"; then
+					NODE_SSL=1
+				else
+					grep '^\[CERT\]' "$LOG" | tail -n 2 | sed 's/^/    /'
+					warn "SSL node cadangan juga gagal. Jalankan installer lagi setelah batas rate limit reset."
+				fi
+			else
+				warn "SSL node gagal. Coba lagi: certbot certonly --standalone -d $NODE_FQDN"
+			fi
+			case "$PANEL_URL" in https://*) warn "Panel HTTPS + node HTTP: console/file manager diblokir browser (mixed content). Selesaikan SSL node." ;; esac
 		fi
 	fi
 	run "Membuka port firewall (jika ufw aktif)" 60 open_firewall || true
 	if want_provision; then
 		step "Auto-create Location & Node (database)"
 		rm -f "$STATE"
-		if ! run "Membuat Location + Node dan mengatur Wings" 420 provision_node; then
+		if ! run "Membuat Location + Node dan mengatur Wings" 600 provision_node; then
 			warn "Auto-create gagal. Detail: $LOG  |  diagnosa: bash $0 --diag"
 		fi
 		grep '^\[PROV\]' "$LOG" | tail -n 8 | sed 's/^/    /'
