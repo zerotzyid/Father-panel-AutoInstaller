@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  ZerotzyID FeatherPanel Auto Installer  v1.0.0
+#  ZerotzyID FeatherPanel Auto Installer  v1.1.0 (patched)
 #  Copyright (c) 2026 zerotzyid  -  https://github.com/zerotzyid
 #
 #  Script installer ini dibuat oleh zerotzyid. FeatherPanel & FeatherWings
@@ -11,7 +11,7 @@ set -uo pipefail
 
 BRAND="zerotzyid"
 GITHUB="https://github.com/zerotzyid"
-VERSION="1.0.0"
+VERSION="1.1.0"
 LOG="/var/log/zerotzyid-installer.log"
 PANEL_DIR="/var/www/featherpanel"
 PANEL_PORT="4831"
@@ -28,6 +28,11 @@ Z_UUID=""; Z_TID=""; Z_TOK=""; NODE_IP=""
 TG_TOKEN="${TG_BOT_TOKEN:-}"; TG_CHAT="${TG_CHAT_ID:-}"
 STEP=0; TOTAL=0; PANEL_URL=""; NODE_SSL=0; NODE_CONFIGURED=0
 NGINX_FRESH=0; PUBLIC_IP=""
+# [FIX 6/7] Semua variabel lintas-fungsi diberi nilai default di awal supaya finish()
+# dan mode --add-node tidak pernah membaca variabel kosong/unbound.
+ZSCHEME=""; J_FQDN=""; J_UUID=""; J_TID=""; J_TOK=""; J_URL=""; J_SCHEME=""
+# [FIX 1] Nilai "unlimited" menurut skema FeatherPanel = 0 (bukan 99999999 / -1).
+ZT_MEM=0; ZT_MEM_OVER=0; ZT_DISK=0; ZT_DISK_OVER=0
 
 # ---------------------------------------------------------------- warna / UI
 if [ -t 1 ]; then
@@ -448,8 +453,20 @@ certbot_email_args() {
 	if [ -n "$EMAIL" ]; then printf '%s\n' -m "$EMAIL"; else printf '%s\n' --register-unsafely-without-email; fi
 }
 
+# [FIX 5] Satu sumber kebenaran untuk lokasi sertifikat. Jika certbot (/etc/letsencrypt)
+# dan acme.sh (/etc/zerotzyid/certs) sama-sama ada, dipilih yang masa berlakunya PALING
+# PANJANG; dipakai oleh setup_nginx_tls, issue_*_cert, write_wings_config dan finish().
+cert_end() { # file -> epoch kadaluarsa (0 jika tidak ada/rusak)
+	local e; [ -s "$1" ] || { echo 0; return; }
+	e=$(openssl x509 -noout -enddate -in "$1" 2>/dev/null | cut -d= -f2)
+	date -d "$e" +%s 2>/dev/null || echo 0
+}
 cert_dir() {
-	if [ -s "/etc/letsencrypt/live/$1/fullchain.pem" ]; then echo "/etc/letsencrypt/live/$1"; else echo "/etc/zerotzyid/certs/$1"; fi
+	local le="/etc/letsencrypt/live/$1" zt="/etc/zerotzyid/certs/$1" a b
+	a=$(cert_end "$le/fullchain.pem"); b=$(cert_end "$zt/fullchain.pem")
+	if [ "$a" -eq 0 ] && [ "$b" -eq 0 ]; then echo "$le"      # belum ada: default certbot
+	elif [ "$a" -ge "$b" ]; then echo "$le"
+	else echo "$zt"; fi
 }
 cert_valid() { # ada & masih valid > 14 hari
 	local d; d=$(cert_dir "$1")
@@ -598,6 +615,25 @@ declare -A VAL=()
 declare -A COLCACHE=()
 want_provision() { [ "$ROLE" = all ] && [ -z "$NODE_CMD" ] && [ "$NO_PROVISION" != 1 ]; }
 
+# [FIX 6] run() menjalankan fungsi di SUBSHELL, jadi variabel hanya bisa kembali lewat $STATE.
+# write_state menulis atomik (chmod 600); load_state membaca dengan WHITELIST kunci
+# (bukan `source`) supaya isi file tidak bisa mengeksekusi perintah.
+STATE_KEYS="NODE_PROVISIONED NODE_ID LOC_ID NODE_VERIFY Z_UUID Z_TID Z_TOK ZSCHEME PANEL_URL NODE_FQDN"
+write_state() { # KEY=VAL ...
+	local t; t=$(umask 077; mktemp "${STATE}.XXXXXX") || return 1
+	printf '%s\n' "$@" >"$t" && chmod 600 "$t" && mv -f "$t" "$STATE"
+}
+load_state() {
+	local k v
+	[ -f "$STATE" ] || return 1
+	while IFS='=' read -r k v; do
+		case " $STATE_KEYS " in *" $k "*) ;; *) continue ;; esac
+		[[ "$v" =~ ^[A-Za-z0-9:/._@-]*$ ]] || continue
+		printf -v "$k" '%s' "$v"
+	done <"$STATE"
+	return 0
+}
+
 mysql_x() { docker exec -i "$DB_CT" sh -c 'exec mysql -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" -N -B "$@"' sh "$@"; }
 sqlq() { local s="$1"; s=${s//\'/}; s=${s//\"/}; s=${s//\\/}; printf "'%s'" "$s"; }
 lit2json() {
@@ -714,8 +750,13 @@ PHPEOF
 	return "$rc"
 }
 
-write_wings_config() { # uuid token_id token scheme
-	local cfg=/etc/featherpanel/config.yml ssl=false
+write_wings_config() { # uuid token_id token scheme fqdn
+	# [FIX 4/5] FQDN node dikirim eksplisit (argumen 5), bukan diambil diam-diam dari $NODE_FQDN.
+	local cfg=/etc/featherpanel/config.yml ssl=false fq="${5:-$NODE_FQDN}" cdir
+	cdir=$(cert_dir "$fq")
+	if [ "$4" = https ] && { [ ! -s "$cdir/fullchain.pem" ] || [ ! -s "$cdir/privkey.pem" ]; }; then
+		echo "[PROV] sertifikat untuk $fq tidak ditemukan di $cdir"; return 1
+	fi
 	mkdir -p /etc/featherpanel /var/lib/featherpanel/volumes
 	[ -f "$cfg" ] && cp -n "$cfg" "$cfg.zerotzyid.bak"
 	[ "$4" = https ] && ssl=true
@@ -729,8 +770,8 @@ api:
   port: 8080
   ssl:
     enabled: $ssl
-    cert: $(cert_dir "$NODE_FQDN")/fullchain.pem
-    key: $(cert_dir "$NODE_FQDN")/privkey.pem
+    cert: $cdir/fullchain.pem
+    key: $cdir/privkey.pem
   upload_limit: 1024
 system:
   data: /var/lib/featherpanel/volumes
@@ -766,7 +807,12 @@ db_prepare() {
 		done
 		return 1
 	fi
-	find_backend || echo "[PROV] container backend (php cli) tidak ditemukan - pakai jalur SQL langsung"
+	# [FIX 2] Backend PHP WAJIB ada (token harus dienkripsi model panel). Tunggu sampai 3 menit.
+	for i in $(seq 1 36); do find_backend && break; sleep 5; done
+	if [ -z "$BE_CT" ]; then
+		echo "[PROV] ERROR: container backend (php cli + vendor) tidak ditemukan; token tidak bisa dienkripsi. Dibatalkan, tidak ada fallback plaintext."
+		return 1
+	fi
 	echo "[PROV] database=$DB_NAME tabel=$T_NODE db=$DB_CT backend=${BE_CT:-none}"
 	bk="/root/zerotzyid-db-backup-$(date +%Y%m%d-%H%M%S).sql"
 	docker exec "$DB_CT" sh -c 'exec $(command -v mysqldump || command -v mariadb-dump) -uroot -p"${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" "$@"' sh "$DB_NAME" "$T_LOC" "$T_NODE" >"$bk" 2>/dev/null &&
@@ -793,38 +839,35 @@ db_create_node() { # fqdn scheme ip
 	if [ -n "$NODE_ID" ]; then
 		Z_UUID=$(echo "SELECT uuid FROM \`$t_node\` WHERE id=$NODE_ID;" | mysql_x "$DB_NAME" 2>/dev/null | head -n1)
 		[ -n "$Z_UUID" ] || Z_UUID=$(cat /proc/sys/kernel/random/uuid)
-		if [ -n "$BE_CT" ] && php_node "{\"__mode\":\"update\",\"__id\":$NODE_ID,\"daemon_token_id\":\"$Z_TID\",\"daemon_token\":\"$Z_TOK\"}"; then
-			via=php-update
-		else
-			echo "UPDATE \`$t_node\` SET daemon_token_id=$(sqlq "$Z_TID"), daemon_token=$(sqlq "$Z_TOK") WHERE id=$NODE_ID;" | mysql_x "$DB_NAME" || { echo "[PROV] update token node gagal"; return 1; }
-			via=sql-update
-		fi
+		# [FIX 1+2] Update juga lewat model PHP (token terenkripsi) + reset memory/disk ke unlimited.
+		php_node "{\"__mode\":\"update\",\"__id\":$NODE_ID,\"daemon_token_id\":\"$Z_TID\",\"daemon_token\":\"$Z_TOK\",\"memory\":$ZT_MEM,\"memory_overallocate\":$ZT_MEM_OVER,\"disk\":$ZT_DISK,\"disk_overallocate\":$ZT_DISK_OVER}" ||
+			{ echo "[PROV] ERROR: update node via model PHP gagal; tidak ada fallback SQL plaintext."; return 1; }
+		via=php-update
 		echo "[PROV] node sudah ada (id=$NODE_ID), token diperbarui via $via"
 	else
 		Z_UUID=$(cat /proc/sys/kernel/random/uuid)
 		VAL=([name]="$(sqlq "$NODE_NAME")" [description]="$(sqlq "Dibuat otomatis oleh zerotzyid installer")"
 			[uuid]="$(sqlq "$Z_UUID")" [public]=1 [fqdn]="$(sqlq "$fq")" [scheme]="$(sqlq "$scheme")"
 			[behind_proxy]=0 [maintenance_mode]=0 [location_id]="$LOC_ID"
-			[memory]=99999999 [memory_overallocate]=-1 [disk]=99999999 [disk_overallocate]=-1
+			[memory]=$ZT_MEM [memory_overallocate]=$ZT_MEM_OVER [disk]=$ZT_DISK [disk_overallocate]=$ZT_DISK_OVER
 			[upload_size]=1024 [daemon_token_id]="$(sqlq "$Z_TID")" [daemon_token]="$(sqlq "$Z_TOK")"
 			[daemon_base]="$(sqlq /var/lib/featherpanel/volumes)" [daemon_listen]=8080 [daemon_sftp]=2022
 			[created_at]="NOW()" [updated_at]="NOW()")
-		if [ -n "$BE_CT" ]; then
-			json=$(build_row "$t_node" json) && php_node "$json" &&
-				NODE_ID=$(echo "SELECT id FROM \`$t_node\` WHERE fqdn=$(sqlq "$fq") LIMIT 1;" | mysql_x "$DB_NAME" 2>/dev/null | head -n1)
-			[ -n "$NODE_ID" ] && via=php-model
-		fi
-		if [ -z "$NODE_ID" ]; then
-			echo "[PROV] memakai jalur SQL langsung (token disimpan apa adanya)"
-			sql=$(build_insert "$t_node") || { echo "[PROV] gagal membangun INSERT node"; return 1; }
-			NODE_ID=$(printf 'START TRANSACTION; %s SELECT LAST_INSERT_ID(); COMMIT;' "$sql" | mysql_x "$DB_NAME") || { echo "[PROV] INSERT node ditolak DB"; return 1; }
-			via=sql
-		fi
-		[[ "$NODE_ID" =~ ^[0-9]+$ ]] || { echo "[PROV] id node tidak valid: '$NODE_ID'"; return 1; }
-		echo "[PROV] node dibuat id=$NODE_ID via $via (memory/disk 99999999 MB, overallocate -1)"
+		# [FIX 2] Create SELALU lewat model PHP panel (App\\Chat\\Node::create -> token dienkripsi).
+		# Jalur SQL langsung (token plaintext) DIHAPUS; jika PHP gagal -> error jelas.
+		json=$(build_row "$t_node" json) || { echo "[PROV] ERROR: gagal membangun data node dari skema DB"; return 1; }
+		php_node "$json" || { echo "[PROV] ERROR: model PHP panel gagal membuat node (lihat pesan di atas). Tidak ada fallback plaintext."; return 1; }
+		NODE_ID=$(echo "SELECT id FROM \`$t_node\` WHERE fqdn=$(sqlq "$fq") LIMIT 1;" | mysql_x "$DB_NAME" 2>/dev/null | head -n1)
+		[[ "$NODE_ID" =~ ^[0-9]+$ ]] || { echo "[PROV] ERROR: node tidak ditemukan di DB setelah create via PHP: '$NODE_ID'"; return 1; }
+		via=php-model
+		echo "[PROV] node dibuat id=$NODE_ID via $via (memory/disk $ZT_MEM MB, overallocate $ZT_MEM_OVER)"
 	fi
 	stored=$(echo "SELECT daemon_token FROM \`$t_node\` WHERE id=$NODE_ID;" | mysql_x "$DB_NAME" 2>/dev/null | head -n1)
-	if [ "$stored" = "$Z_TOK" ]; then echo "[PROV] token tersimpan plaintext"; else echo "[PROV] token tersimpan terenkripsi oleh panel"; fi
+	# [FIX 2] Token yang tersimpan sama persis dengan plaintext = enkripsi tidak terjadi -> GAGAL.
+	if [ -z "$stored" ] || [ "$stored" = "$Z_TOK" ]; then
+		echo "[PROV] ERROR: token tersimpan plaintext/kosong; model PHP tidak mengenkripsi. Dibatalkan."; return 1
+	fi
+	echo "[PROV] token tersimpan terenkripsi oleh panel"
 
 	if [ "$NO_ALLOC" != 1 ] && [ -n "$ip" ] && [[ "$ALLOC_RANGE" =~ ^[0-9]+-[0-9]+$ ]]; then
 		a=${ALLOC_RANGE%-*}; b=${ALLOC_RANGE#*-}
@@ -851,9 +894,9 @@ provision_node() { # role all: buat di DB + konfigurasi Wings lokal
 	[ "$NODE_SSL" = 1 ] && scheme=https
 	db_prepare || return 1
 	db_create_node "$NODE_FQDN" "$scheme" "$PUBLIC_IP" || return 1
-	write_wings_config "$Z_UUID" "$Z_TID" "$Z_TOK" "$scheme"
+	write_wings_config "$Z_UUID" "$Z_TID" "$Z_TOK" "$scheme" "$NODE_FQDN" || return 1
 	wings_start_verify "$scheme"
-	printf 'NODE_PROVISIONED=1\nNODE_ID=%s\nLOC_ID=%s\nNODE_VERIFY=%s\n' "$NODE_ID" "$LOC_ID" "$WV" >"$STATE"
+	write_state "NODE_PROVISIONED=1" "NODE_ID=$NODE_ID" "LOC_ID=$LOC_ID" "NODE_VERIFY=$WV" "ZSCHEME=$scheme"
 }
 
 derive_panel_url() {
@@ -864,31 +907,48 @@ derive_panel_url() {
 		[ -n "$fq" ] && break
 	done
 	[ -n "$fq" ] || return 1
-	if [ -d "/etc/letsencrypt/live/$fq" ]; then echo "https://$fq"; else echo "http://$fq"; fi
+	# [FIX 3] https jika Nginx panel benar-benar melayani 443/SSL (certbot atau sertifikat cadangan),
+	# bukan hanya dengan mengecek folder letsencrypt.
+	if grep -qE 'listen[^;]*443|ssl_certificate[[:space:]]' "$f" 2>/dev/null; then echo "https://$fq"; else echo "http://$fq"; fi
 }
 
 addnode_main() { # di server PANEL: buat node untuk VPS lain
+	# [FIX 3] scheme dihitung eksplisit: https kecuali --no-ssl; selalu ditulis ke $STATE.
 	local scheme=https ip
 	[ "$NO_SSL" = 1 ] && scheme=http
 	ip=$(getent ahostsv4 "$NODE_FQDN" 2>/dev/null | awk 'NR==1{print $1}')
 	db_prepare || return 1
-	db_create_node "$NODE_FQDN" "$scheme" "$ip" || return 1
-	umask 077
-	printf 'NODE_ID=%s\nLOC_ID=%s\nZ_UUID=%s\nZ_TID=%s\nZ_TOK=%s\nZSCHEME=%s\n' "$NODE_ID" "$LOC_ID" "$Z_UUID" "$Z_TID" "$Z_TOK" "$scheme" >"$STATE"
+	db_create_node "$NODE_FQDN" "$scheme" "$ip" || return 1   # [FIX 2] sudah lewat php_node()
+	[ -n "$Z_UUID" ] && [ -n "$Z_TID" ] && [ -n "$Z_TOK" ] || { echo "[PROV] ERROR: kredensial node kosong"; return 1; }
+	write_state "NODE_ID=$NODE_ID" "LOC_ID=$LOC_ID" "Z_UUID=$Z_UUID" "Z_TID=$Z_TID" "Z_TOK=$Z_TOK" "ZSCHEME=$scheme"
 }
 
-join_node() { # di VPS node: pakai kode dari --add-node
-	local dec uuid tid tok purl scheme sch=http
-	dec=$(printf '%s' "$JOIN_BLOB" | base64 -d 2>/dev/null) || { echo "[PROV] kode join tidak valid"; return 1; }
-	IFS='|' read -r uuid tid tok purl scheme <<<"$dec"
-	{ [[ "$uuid" =~ ^[0-9a-f-]{36}$ ]] && [[ "$tid" =~ ^[0-9a-f]{16}$ ]] && [[ "$tok" =~ ^[0-9a-f]{64}$ ]] &&
-		[[ "$purl" =~ ^https?://[a-z0-9.-]+$ ]]; } || { echo "[PROV] isi kode join tidak valid"; return 1; }
-	PANEL_URL="$purl"
+# [FIX 4] Dipanggil di shell UTAMA (sebelum gather) supaya FQDN dari kode join tersedia.
+# Format blob: uuid|token_id|token|panel_url|scheme|node_fqdn  (field ke-6 opsional; blob lama 5 field tetap diterima)
+parse_join_blob() {
+	local dec
+	dec=$(printf '%s' "$JOIN_BLOB" | base64 -d 2>/dev/null) || die "Kode join tidak valid (bukan base64)."
+	IFS='|' read -r J_UUID J_TID J_TOK J_URL J_SCHEME J_FQDN <<<"$dec"
+	{ [[ "$J_UUID" =~ ^[0-9a-f-]{36}$ ]] && [[ "$J_TID" =~ ^[0-9a-f]{16}$ ]] && [[ "$J_TOK" =~ ^[0-9a-f]{64}$ ]] &&
+		[[ "$J_URL" =~ ^https?://[a-z0-9.-]+$ ]] && [[ "$J_SCHEME" =~ ^https?$ ]]; } || die "Isi kode join tidak valid."
+	[ -z "$J_FQDN" ] || valid_fqdn "$J_FQDN" || die "FQDN di kode join tidak valid."
+	PANEL_URL="$J_URL"   # [FIX 4] PANEL_URL selalu dari kode join
+	if [ -n "$J_FQDN" ]; then
+		if [ -z "$NODE_FQDN" ]; then NODE_FQDN="$J_FQDN"
+		elif [ "$NODE_FQDN" != "$J_FQDN" ]; then
+			warn "--node-fqdn ($NODE_FQDN) beda dengan FQDN di kode join ($J_FQDN). Memakai --node-fqdn; samakan FQDN node di Admin > Nodes."
+		fi
+	fi
+}
+
+join_node() { # di VPS node: pakai kode dari --add-node (sudah di-parse oleh parse_join_blob)
+	local sch=http
+	[ -n "$NODE_FQDN" ] || { echo "[PROV] FQDN node tidak diketahui (butuh --node-fqdn atau kode join baru)"; return 1; }
 	[ "$NODE_SSL" = 1 ] && sch=https
-	[ "$sch" = "$scheme" ] || echo "[PROV] peringatan: scheme di panel=$scheme, node=$sch (samakan di Admin > Nodes)"
-	write_wings_config "$uuid" "$tid" "$tok" "$sch"
+	[ "$sch" = "$J_SCHEME" ] || echo "[PROV] peringatan: scheme di panel=$J_SCHEME, node=$sch (samakan di Admin > Nodes)"
+	write_wings_config "$J_UUID" "$J_TID" "$J_TOK" "$sch" "$NODE_FQDN" || return 1   # [FIX 4/5]
 	wings_start_verify "$sch"
-	printf 'NODE_PROVISIONED=1\nNODE_VERIFY=%s\n' "$WV" >"$STATE"
+	write_state "NODE_PROVISIONED=1" "NODE_VERIFY=$WV" "PANEL_URL=$PANEL_URL" "NODE_FQDN=$NODE_FQDN" "ZSCHEME=$sch"
 }
 
 # --------------------------------------------------------------- diagnosa
@@ -1014,6 +1074,9 @@ finish() {
 	say ""; boxbar "╔" "╗"
 	boxline "SELESAI dalam $took"
 	boxbar "╚" "╝"
+	# [FIX 7] default aman untuk semua variabel yang dipakai finish()
+	: "${PANEL_URL:=}" "${NODE_FQDN:=}" "${NODE_SSL:=0}" "${NODE_CONFIGURED:=0}" "${NODE_PROVISIONED:=0}" "${NODE_VERIFY:=}" "${LOC_ID:=}" "${NODE_ID:=}"
+	[ "$ROLE" = node ] && [ -n "$PANEL_URL" ] && say "  ${CB}Panel${C0}  : ${CG}${PANEL_URL}${C0} (dari kode join)"
 	has_panel && say "  ${CB}Panel${C0}  : ${CG}${PANEL_URL}${C0}"
 	has_panel && say "           Buka URL di atas untuk menyelesaikan akun admin."
 	if has_node; then
@@ -1023,7 +1086,7 @@ finish() {
 			say "                 $(cert_dir "$NODE_FQDN")/privkey.pem"
 		fi
 		if [ "$NODE_PROVISIONED" = 1 ]; then
-			say "           Location id=$LOC_ID & Node id=$NODE_ID dibuat otomatis (memory/disk unlimited)."
+			say "           Location id=$LOC_ID & Node id=$NODE_ID dibuat otomatis (memory/disk unlimited = 0, token terenkripsi)."
 			if [ "$NODE_VERIFY" = ok ]; then
 				say "           Wings aktif & tanpa error token. Cek Admin > Nodes: harus hijau/online."
 			else
@@ -1042,7 +1105,7 @@ finish() {
 	say ""
 	say "  ${CY}(c) 2026 zerotzyid - ${GITHUB}${C0}"
 	tg "SELESAI ($took). Panel: ${PANEL_URL:-n/a} | Node: ${NODE_FQDN:-n/a} | node_configured=$NODE_CONFIGURED"
-	echo "ZEROTZY_RESULT {\"status\":\"ok\",\"role\":\"$ROLE\",\"panel_url\":\"${PANEL_URL}\",\"node_fqdn\":\"${NODE_FQDN}\",\"node_ssl\":$NODE_SSL,\"node_configured\":$NODE_CONFIGURED,\"node_provisioned\":$NODE_PROVISIONED,\"node_verify\":\"$NODE_VERIFY\",\"seconds\":$SECONDS}"
+	echo "ZEROTZY_RESULT {\"status\":\"ok\",\"role\":\"$ROLE\",\"panel_url\":\"${PANEL_URL}\",\"node_fqdn\":\"${NODE_FQDN}\",\"node_ssl\":$NODE_SSL,\"node_configured\":$NODE_CONFIGURED,\"node_provisioned\":$NODE_PROVISIONED,\"node_verify\":\"$NODE_VERIFY\",\"node_id\":\"${NODE_ID}\",\"location_id\":\"${LOC_ID}\",\"seconds\":$SECONDS}"
 }
 
 # -------------------------------------------------------------------- main
@@ -1069,17 +1132,20 @@ if [ "$MODE" = addnode ]; then
 	rm -f "$STATE"
 	run "Membuat Location + Node di panel" 600 addnode_main || { grep '^\[PROV\]' "$LOG" | tail -n 6 | sed 's/^/    /'; die "Gagal membuat node di panel (lihat $LOG, coba --diag)"; }
 	grep '^\[PROV\]' "$LOG" | tail -n 8 | sed 's/^/    /'
-	# shellcheck disable=SC1090
-	. "$STATE"; rm -f "$STATE"
-	blob=$(printf '%s|%s|%s|%s|%s' "$Z_UUID" "$Z_TID" "$Z_TOK" "$PANEL_URL" "$ZSCHEME" | base64 -w0)
+	load_state || die "State node tidak ditemukan ($STATE)"; rm -f "$STATE"
+	# [FIX 3] pastikan semua field blob terisi & valid sebelum dibuat
+	[[ "$ZSCHEME" =~ ^https?$ ]] || die "Scheme node tidak valid: '$ZSCHEME'"
+	[ -n "$Z_UUID" ] && [ -n "$Z_TID" ] && [ -n "$Z_TOK" ] && [ -n "$PANEL_URL" ] || die "Data join tidak lengkap"
+	blob=$(printf '%s|%s|%s|%s|%s|%s' "$Z_UUID" "$Z_TID" "$Z_TOK" "$PANEL_URL" "$ZSCHEME" "$NODE_FQDN" | base64 -w0)
 	say ""
 	say "  ${CG}Node dibuat${C0} (id=$NODE_ID, location id=$LOC_ID, ${NODE_FQDN})."
 	say "  Jalankan di ${CB}VPS node${C0} (DNS $NODE_FQDN harus sudah mengarah ke VPS itu):"
 	say ""
-	say "  sudo bash zerotzyid-installer.sh --bot --role node --node-fqdn $NODE_FQDN --join $blob"
+	say "  sudo bash zerotzyid-installer.sh --bot --role node --yes --join $blob"
+	say "  (opsional: tambahkan --node-fqdn $NODE_FQDN; kini FQDN sudah ada di dalam kode join)"
 	say ""
 	say "  ${CY}Kode join berisi rahasia node - jangan dibagikan.${C0}"
-	echo "ZEROTZY_RESULT {\"status\":\"ok\",\"action\":\"add-node\",\"node_id\":$NODE_ID,\"node_fqdn\":\"$NODE_FQDN\",\"join\":\"$blob\"}"
+	echo "ZEROTZY_RESULT {\"status\":\"ok\",\"action\":\"add-node\",\"node_id\":$NODE_ID,\"node_fqdn\":\"$NODE_FQDN\",\"location_id\":$LOC_ID,\"scheme\":\"$ZSCHEME\",\"panel_url\":\"$PANEL_URL\",\"join\":\"$blob\"}"
 	exit 0
 fi
 if [ "$MODE" = diag ]; then
@@ -1095,6 +1161,12 @@ if [ "$MODE" = uninstall ]; then
 	exit 0
 fi
 [ "$MODE" = reinstall ] && purge_all
+# [FIX 4] decode kode join SEBELUM gather agar FQDN node bisa berasal dari kode join
+if [ -n "$JOIN_BLOB" ]; then
+	[ "$ROLE" = node ] || [ -z "$ROLE" ] || die "--join hanya untuk --role node"
+	ROLE=node
+	parse_join_blob
+fi
 gather
 
 TOTAL=3
@@ -1205,8 +1277,7 @@ if has_node; then
 			warn "Auto-create gagal. Detail: $LOG  |  diagnosa: bash $0 --diag"
 		fi
 		grep '^\[PROV\]' "$LOG" | tail -n 8 | sed 's/^/    /'
-		# shellcheck disable=SC1090
-		[ -f "$STATE" ] && . "$STATE"
+		load_state || true   # [FIX 6] whitelist loader
 		[ "$NODE_PROVISIONED" = 1 ] && NODE_CONFIGURED=1
 	fi
 	if [ "$ROLE" = node ] && [ -n "$JOIN_BLOB" ]; then
@@ -1216,8 +1287,7 @@ if has_node; then
 			warn "Join gagal. Detail: $LOG"
 		fi
 		grep '^\[PROV\]' "$LOG" | tail -n 6 | sed 's/^/    /'
-		# shellcheck disable=SC1090
-		[ -f "$STATE" ] && . "$STATE"
+		load_state || true   # [FIX 6] mengembalikan PANEL_URL/NODE_FQDN/NODE_VERIFY dari subshell
 		rm -f "$STATE"
 		[ "$NODE_PROVISIONED" = 1 ] && NODE_CONFIGURED=1
 	fi
